@@ -78,8 +78,34 @@ export default function App() {
   }, [picks]);
   const myStatus = useMemo(() => computeStatus(picks, results), [picks, results]);
 
-  function togglePick(roundId, team, max) {
-    if (!user) return; setSaved(false);
+  // Pick popularity per round → { roundId: { team: count } }, plus total entries.
+  // Only revealed in the UI once a round's picks are locked (entry deadline passed
+  // for group, or the round has any results in), so players don't copy each other early.
+  const popularity = useMemo(() => {
+    const p = {};
+    entries.forEach((e) => {
+      Object.entries(e.picks || {}).forEach(([rid, teams]) => {
+        p[rid] = p[rid] || {};
+        teams.forEach((t) => (p[rid][t] = (p[rid][t] || 0) + 1));
+      });
+    });
+    return p;
+  }, [entries]);
+  const totalEntries = entries.length;
+
+  // A round is locked until the PREVIOUS round is fully resolved as a win:
+  // you picked the required number of teams AND all of them have a "win" result.
+  const isRoundLocked = useMemo(() => (roundIdx) => {
+    if (roundIdx === 0) return false; // group stage always open
+    const prev = ROUNDS[roundIdx - 1];
+    const prevPicks = picks[prev.id] || [];
+    if (prevPicks.length < prev.picks) return true;        // didn't finish picking
+    const prevRes = results[prev.id] || {};
+    return !prevPicks.every((t) => prevRes[t] === "win");  // not all confirmed winners
+  }, [picks, results]);
+
+  function togglePick(roundId, team, max, locked) {
+    if (!user || locked) return; setSaved(false);
     setPicks((prev) => {
       const cur = prev[roundId] || [];
       if (cur.includes(team)) return { ...prev, [roundId]: cur.filter((t) => t !== team) };
@@ -113,7 +139,7 @@ export default function App() {
             adminConfigured={adminConfigured} onSignOut={() => signOut(auth)} />
           <main className="wc-main">
             {view === "picks" && (
-              <Picks {...{ picks, togglePick, usedTeams, results, saveEntry, saved, myStatus }} />
+              <Picks {...{ picks, togglePick, usedTeams, results, saveEntry, saved, myStatus, isRoundLocked, popularity, totalEntries }} />
             )}
             {view === "standings" && <Standings entries={entries} results={results} />}
             {view === "admin" && isAdmin && <Admin results={results} markResult={markResult} />}
@@ -160,6 +186,40 @@ function Landing({ onLogin }) {
             <span key={i}>{f}</span>
           ))}
         </div>
+
+        <div className="wc-rules wc-fade" style={{ animationDelay: ".75s" }}>
+          <div className="wc-rules-title">HOW IT WORKS</div>
+          <div className="wc-rules-grid">
+            <div className="wc-rule">
+              <span className="wc-rule-num">01</span>
+              <div>
+                <strong>Group Stage</strong>
+                Pick 4 teams you think will reach the Round of 32. All 4 must advance or you're out.
+              </div>
+            </div>
+            <div className="wc-rule">
+              <span className="wc-rule-num">02</span>
+              <div>
+                <strong>Knockout Stage</strong>
+                Pick 1 team per round — except the Round of 32, Round of 16, and Quarterfinals, where you pick 2.
+              </div>
+            </div>
+            <div className="wc-rule">
+              <span className="wc-rule-num">03</span>
+              <div>
+                <strong>Win or Go Home</strong>
+                Every pick in a round must win — in regulation, extra time, or a shootout. One loss eliminates you.
+              </div>
+            </div>
+            <div className="wc-rule">
+              <span className="wc-rule-num">04</span>
+              <div>
+                <strong>Each Team Once</strong>
+                You can use a team a single time across the whole contest. The last surviving entry wins.
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -197,13 +257,15 @@ function TopBar({ user, view, setView, isAdmin, adminConfigured, onSignOut }) {
 }
 
 // ── PICKS ───────────────────────────────────────────────────────
-function Picks({ picks, togglePick, usedTeams, results, saveEntry, saved, myStatus }) {
+function Picks({ picks, togglePick, usedTeams, results, saveEntry, saved, myStatus, isRoundLocked, popularity, totalEntries }) {
+  const [picker, setPicker] = useState(null); // { roundId, roundIdx } or null
+
   return (
     <div className="wc-picks">
       <div className="wc-picks-head wc-fade">
         <div>
           <h2 className="wc-h2">Your Bracket</h2>
-          <p className="wc-muted">Lock in each round. Greyed teams are already used elsewhere.</p>
+          <p className="wc-muted">Build your run left to right. Each round unlocks once your previous picks all win.</p>
         </div>
         <button className={"wc-save" + (saved ? " done" : "")} onClick={saveEntry}>
           {saved ? "✓ Saved" : "Save Picks"}
@@ -216,58 +278,127 @@ function Picks({ picks, togglePick, usedTeams, results, saveEntry, saved, myStat
         </div>
       )}
 
-      {ROUNDS.map((r, i) => {
-        const sel = picks[r.id] || [];
-        const done = sel.length === r.picks;
-        return (
-          <section key={r.id} className={"wc-round wc-fade" + (done ? " done" : "")}
-            style={{ animationDelay: `${0.05 * i}s` }}>
-            <div className="wc-round-head">
-              <div className="wc-round-title">
-                <span className="wc-round-name">{r.label}</span>
-                <span className="wc-round-lock">Locks {r.deadline}</span>
+      <div className="wc-bracket-scroll">
+        <div className="wc-bracket">
+          {ROUNDS.map((r, i) => {
+            const sel = picks[r.id] || [];
+            const done = sel.length === r.picks;
+            const locked = isRoundLocked(i);
+            // Reveal pick popularity only once this round has any results posted
+            // (i.e. picks are locked in / games underway) — never before.
+            const revealPopularity = Object.keys(results[r.id] || {}).length > 0;
+            return (
+              <div key={r.id} className={"wc-col" + (locked ? " locked" : "") + (done ? " done" : "")}>
+                <div className="wc-col-head">
+                  <div className="wc-col-name">{r.label}</div>
+                  <div className="wc-col-meta">
+                    {locked ? <span className="wc-lockicon">🔒</span>
+                      : <span className={"wc-col-count" + (done ? " done" : "")}>{sel.length}/{r.picks}</span>}
+                  </div>
+                </div>
+
+                <div className="wc-slots">
+                  {Array.from({ length: r.picks }).map((_, slotIdx) => {
+                    const team = sel[slotIdx];
+                    const res = team ? (results[r.id] || {})[team] : null;
+                    const count = team ? (popularity[r.id]?.[team] || 0) : 0;
+                    const pct = totalEntries > 0 ? Math.round((count / totalEntries) * 100) : 0;
+                    let cls = "wc-slot";
+                    if (team) cls += " filled";
+                    if (res === "win") cls += " win celebrate";
+                    if (res === "loss") cls += " loss";
+                    if (locked) cls += " locked";
+                    return (
+                      <button key={slotIdx} className={cls}
+                        disabled={locked}
+                        onClick={() => {
+                          if (locked) return;
+                          if (team) togglePick(r.id, team, r.picks, locked); // tap filled = remove
+                          else setPicker({ roundId: r.id, roundIdx: i });
+                        }}>
+                        {team ? (
+                          <>
+                            <span className="wc-slot-flag">{FLAG[team]}</span>
+                            <span className="wc-slot-team">{team}</span>
+                            {res === "win" && <span className="wc-slot-mark win">✓</span>}
+                            {res === "loss" && <span className="wc-slot-mark loss">✕</span>}
+                            {revealPopularity && (
+                              <span className="wc-slot-pop">{pct}%</span>
+                            )}
+                          </>
+                        ) : locked ? (
+                          <span className="wc-slot-empty">Locked</span>
+                        ) : (
+                          <span className="wc-slot-empty">+ Pick team</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <div className={"wc-count" + (done ? " done" : "")}>{sel.length}/{r.picks}</div>
-            </div>
-            <div className="wc-round-body">
-              {r.id === "group"
-                ? Object.entries(GROUPS).map(([g, teams]) => (
-                    <div key={g} className="wc-group">
-                      <div className="wc-group-tag">GROUP {g}</div>
-                      <div className="wc-chips">
-                        {teams.map(([t]) => (
-                          <Chip key={t} {...{ t, r, sel, usedTeams, results, togglePick }} />
-                        ))}
-                      </div>
-                    </div>
-                  ))
-                : <div className="wc-chips">
-                    {ALL_TEAMS.map((t) => (
-                      <Chip key={t} {...{ t, r, sel, usedTeams, results, togglePick }} />
-                    ))}
-                  </div>}
-            </div>
-          </section>
-        );
-      })}
+            );
+          })}
+        </div>
+      </div>
+
+      {picker && (
+        <TeamPicker
+          round={ROUNDS.find((r) => r.id === picker.roundId)}
+          picks={picks} usedTeams={usedTeams} results={results}
+          onPick={(team) => {
+            togglePick(picker.roundId, team, ROUNDS[picker.roundIdx].picks, false);
+            // close if this fills the round
+            const after = (picks[picker.roundId] || []).length + 1;
+            if (after >= ROUNDS[picker.roundIdx].picks) setPicker(null);
+          }}
+          onClose={() => setPicker(null)}
+        />
+      )}
     </div>
   );
 }
 
-function Chip({ t, r, sel, usedTeams, results, togglePick }) {
+function TeamPicker({ round, picks, usedTeams, results, onPick, onClose }) {
+  const sel = picks[round.id] || [];
+  const body = round.id === "group"
+    ? Object.entries(GROUPS).map(([g, teams]) => (
+        <div key={g} className="wc-group">
+          <div className="wc-group-tag">GROUP {g}</div>
+          <div className="wc-chips">
+            {teams.map(([t]) => <PickerChip key={t} {...{ t, sel, usedTeams, onPick }} />)}
+          </div>
+        </div>
+      ))
+    : <div className="wc-chips">
+        {ALL_TEAMS.map((t) => <PickerChip key={t} {...{ t, sel, usedTeams, onPick }} />)}
+      </div>;
+
+  return (
+    <div className="wc-modal" onClick={onClose}>
+      <div className="wc-modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="wc-modal-head">
+          <div>
+            <div className="wc-modal-title">{round.label}</div>
+            <div className="wc-muted">Pick {round.picks} · {sel.length} selected</div>
+          </div>
+          <button className="wc-modal-x" onClick={onClose}>✕</button>
+        </div>
+        <div className="wc-modal-body">{body}</div>
+      </div>
+    </div>
+  );
+}
+
+function PickerChip({ t, sel, usedTeams, onPick }) {
   const picked = sel.includes(t);
-  const locked = usedTeams.has(t) && !picked;
-  const res = (results[r.id] || {})[t];
+  const usedLock = usedTeams.has(t) && !picked;
   let cls = "wc-chip";
   if (picked) cls += " picked";
-  if (locked) cls += " locked";
-  if (picked && res === "win") cls += " win";
-  if (picked && res === "loss") cls += " loss";
+  if (usedLock) cls += " locked";
   return (
-    <button className={cls} disabled={locked} onClick={() => togglePick(r.id, t, r.picks)}>
+    <button className={cls} disabled={usedLock} onClick={() => onPick(t)}>
       <span className="wc-chip-flag">{FLAG[t]}</span>{t}
-      {picked && res === "win" && <span className="wc-chip-mark">✓</span>}
-      {picked && res === "loss" && <span className="wc-chip-mark">✕</span>}
+      {picked && <span className="wc-chip-mark">✓</span>}
     </button>
   );
 }
@@ -489,6 +620,79 @@ body{margin:0}
 .wc-chip.win{background:linear-gradient(135deg,#19e6c8,#10b981);color:#04231b}
 .wc-chip.loss{background:linear-gradient(135deg,#ff2d78,#e11d48);color:#fff}
 .wc-chip-mark{font-weight:800;margin-left:2px}
+.wc-lockicon{font-size:15px}
+
+/* bracket */
+.wc-bracket-scroll{overflow-x:auto;padding:6px 2px 18px;-webkit-overflow-scrolling:touch}
+.wc-bracket{display:flex;gap:0;min-width:max-content;align-items:stretch}
+.wc-col{position:relative;min-width:212px;padding:0 20px;display:flex;flex-direction:column;
+  border-left:1px dashed rgba(255,255,255,.07)}
+.wc-col:first-child{border-left:none;padding-left:2px}
+.wc-col.locked{opacity:.5}
+.wc-col.done .wc-col-name{color:var(--teal)}
+.wc-col-head{margin-bottom:12px}
+.wc-col-name{font-family:'Bebas Neue';font-size:20px;letter-spacing:.5px;line-height:1;transition:color .3s}
+.wc-col-meta{margin-top:3px}
+.wc-col-count{font-family:'Bebas Neue';font-size:15px;color:var(--gold);letter-spacing:1px}
+.wc-col-count.done{color:var(--teal)}
+.wc-slots{display:flex;flex-direction:column;gap:12px;justify-content:center;flex:1}
+.wc-slot{position:relative;display:flex;align-items:center;gap:8px;width:100%;min-height:48px;
+  background:var(--navy2);border:1.5px dashed var(--line);border-radius:12px;
+  padding:8px 12px;cursor:pointer;color:var(--dim);font-size:13.5px;font-weight:600;
+  transition:transform .14s cubic-bezier(.2,.8,.2,1),border-color .15s,background .15s,box-shadow .2s;
+  text-align:left}
+.wc-slot:hover:not(:disabled){transform:translateY(-2px) scale(1.015);border-color:var(--blue);
+  color:var(--txt);box-shadow:0 6px 20px rgba(43,127,255,.18)}
+.wc-slot:active:not(:disabled){transform:scale(.97)}
+/* connector line from a filled slot to the next column */
+.wc-slot.filled::after{content:"";position:absolute;right:-21px;top:50%;width:20px;height:2px;
+  background:linear-gradient(90deg,var(--teal),transparent);opacity:.5}
+.wc-col:last-child .wc-slot.filled::after{display:none}
+.wc-slot.filled{background:var(--grad);border:1.5px solid transparent;color:#fff;font-weight:700;
+  box-shadow:0 4px 16px rgba(255,45,120,.25)}
+.wc-slot.win{background:linear-gradient(135deg,#19e6c8,#10b981);color:#04231b}
+.wc-slot.win::after{background:linear-gradient(90deg,#19e6c8,transparent);opacity:.8}
+.wc-slot.loss{background:linear-gradient(135deg,#ff2d78,#e11d48);color:#fff}
+.wc-slot.loss::after{display:none}
+.wc-slot.locked{cursor:not-allowed;border-style:solid;opacity:.7}
+.wc-slot.celebrate{animation:wcPop .5s cubic-bezier(.2,1.4,.4,1)}
+@keyframes wcPop{0%{transform:scale(1)}40%{transform:scale(1.08)}100%{transform:scale(1)}}
+.wc-slot-flag{font-size:18px;line-height:1}
+.wc-slot-team{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wc-slot-mark{font-weight:800;font-size:15px}
+.wc-slot-pop{position:absolute;right:8px;bottom:-9px;font-size:10px;font-weight:800;
+  letter-spacing:.5px;background:var(--navy);color:var(--gold);border:1px solid var(--line);
+  padding:1px 7px;border-radius:20px;animation:wcFade .4s ease}
+.wc-slot-empty{opacity:.7}
+
+/* team picker modal */
+.wc-modal{position:fixed;inset:0;z-index:50;background:rgba(4,7,14,.7);
+  backdrop-filter:blur(6px);display:flex;align-items:flex-end;justify-content:center;
+  animation:wcFade .2s ease}
+.wc-modal-card{background:var(--navy2);border:1px solid var(--line);border-radius:22px 22px 0 0;
+  width:100%;max-width:620px;max-height:82vh;display:flex;flex-direction:column;
+  animation:wcSlideUp .3s cubic-bezier(.2,.8,.2,1)}
+@media(min-width:640px){.wc-modal{align-items:center}.wc-modal-card{border-radius:22px}}
+@keyframes wcSlideUp{from{transform:translateY(40px);opacity:.6}to{transform:none;opacity:1}}
+.wc-modal-head{display:flex;justify-content:space-between;align-items:center;
+  padding:18px 20px;border-bottom:1px solid var(--line)}
+.wc-modal-title{font-family:'Bebas Neue';font-size:24px;letter-spacing:.5px}
+.wc-modal-x{background:var(--panel);border:1px solid var(--line);color:var(--txt);
+  width:34px;height:34px;border-radius:10px;cursor:pointer;font-size:14px}
+.wc-modal-body{padding:18px 20px;overflow-y:auto}
+
+/* landing rules */
+.wc-rules{margin-top:46px;text-align:left;max-width:560px;margin-left:auto;margin-right:auto}
+.wc-rules-title{font-family:'Bebas Neue';letter-spacing:4px;font-size:14px;color:var(--dim);
+  text-align:center;margin-bottom:18px}
+.wc-rules-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:560px){.wc-rules-grid{grid-template-columns:1fr}}
+.wc-rule{display:flex;gap:13px;background:rgba(20,29,48,.6);border:1px solid var(--line);
+  border-radius:15px;padding:16px;backdrop-filter:blur(8px)}
+.wc-rule-num{font-family:'Bebas Neue';font-size:22px;background:var(--grad);
+  -webkit-background-clip:text;background-clip:text;color:transparent;line-height:1}
+.wc-rule strong{display:block;margin-bottom:4px;font-size:15px}
+.wc-rule div{font-size:13.5px;color:var(--dim);line-height:1.5}
 
 /* standings */
 .wc-stand-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px}
